@@ -15,6 +15,7 @@ use iceoryx2::{
         subscriber::{Subscriber, SubscriberReceiveError},
     },
     prelude::{zero_copy, Iox2, Iox2Event, Service, ServiceName},
+    sample::Sample,
     service::port_factory::publish_subscribe::PortFactory,
 };
 use thiserror::Error;
@@ -76,10 +77,10 @@ pub enum PubSubError {
 }
 
 pub struct IceoryxPubSub {
-    _pub_factory: PortFactory<zero_copy::Service, BinPayload>,
-    _sub_factory: PortFactory<zero_copy::Service, BinPayload>,
-    publisher: Publisher<zero_copy::Service, BinPayload>,
-    subscriber: Subscriber<zero_copy::Service, BinPayload>,
+    _pub_factory: PortFactory<zero_copy::Service, Request>,
+    _sub_factory: PortFactory<zero_copy::Service, LiveEvent>,
+    publisher: Publisher<zero_copy::Service, Request>,
+    subscriber: Subscriber<zero_copy::Service, LiveEvent>,
 }
 
 impl IceoryxPubSub {
@@ -89,7 +90,7 @@ impl IceoryxPubSub {
             .publish_subscribe()
             .max_publishers(1)
             .max_subscribers(1000)
-            .open_or_create::<BinPayload>()?;
+            .open_or_create::<LiveEvent>()?;
 
         let subscriber = sub_factory.subscriber().create()?;
 
@@ -98,7 +99,7 @@ impl IceoryxPubSub {
             .publish_subscribe()
             .max_publishers(1000)
             .max_subscribers(1)
-            .open_or_create::<BinPayload>()?;
+            .open_or_create::<Request>()?;
 
         let publisher = pub_factory.publisher().create()?;
 
@@ -110,26 +111,14 @@ impl IceoryxPubSub {
         })
     }
 
-    pub fn receive(&self) -> Result<Option<LiveEvent>, PubSubError> {
-        match self.subscriber.receive()? {
-            None => Ok(None),
-            Some(sample) => {
-                let bytes = &sample.data[0..sample.len];
-                let (decoded, _len): (LiveEvent, usize) =
-                    bincode::decode_from_slice(bytes, config::standard())?;
-                Ok(Some(decoded))
-            }
-        }
+    pub fn receive(
+        &self,
+    ) -> Result<Option<Sample<LiveEvent, iceoryx2::service::zero_copy::Service>>, PubSubError> {
+        Ok(self.subscriber.receive()?)
     }
 
     pub fn send(&self, req: Request) -> Result<(), PubSubError> {
-        let sample = self.publisher.loan_uninit()?;
-        let mut sample = unsafe { sample.assume_init() };
-        let payload = sample.payload_mut();
-
-        let length = bincode::encode_into_slice(&req, &mut payload.data, config::standard())?;
-
-        payload.len = length;
+        let sample = self.publisher.loan_uninit()?.write_payload(req);
         sample.send()?;
         Ok(())
     }
@@ -354,8 +343,14 @@ where
 
             let mut no_data = 0;
             for subscriber in &self.pubsub {
-                match subscriber.receive()? {
-                    Some(LiveEvent::FeedBatch { asset_no, events }) => {
+                let Some(ref ev) = subscriber.receive()? else {
+                    no_data += 1;
+                    continue;
+                };
+
+                match ev.payload() {
+                    LiveEvent::FeedBatch { asset_no, events } => {
+                        let asset_no = *asset_no;
                         for event in events {
                             *unsafe { self.last_feed_latency.get_unchecked_mut(asset_no) } =
                                 Some((event.exch_ts, event.local_ts));
@@ -370,14 +365,15 @@ where
                                 && self.last_trades_capacity > 0
                             {
                                 let trade = unsafe { self.trade.get_unchecked_mut(asset_no) };
-                                trade.push(event);
+                                trade.push(event.clone());
                             }
                         }
                         if WAIT_NEXT_FEED {
                             return Ok(true);
                         }
                     }
-                    Some(LiveEvent::Feed { asset_no, event }) => {
+                    LiveEvent::Feed { asset_no, event } => {
+                        let asset_no = *asset_no;
                         *unsafe { self.last_feed_latency.get_unchecked_mut(asset_no) } =
                             Some((event.exch_ts, event.local_ts));
                         if event.is(LOCAL_BID_DEPTH_EVENT) {
@@ -391,10 +387,11 @@ where
                             && self.last_trades_capacity > 0
                         {
                             let trade = unsafe { self.trade.get_unchecked_mut(asset_no) };
-                            trade.push(event);
+                            trade.push(event.clone());
                         }
                     }
-                    Some(LiveEvent::Order { asset_no, order }) => {
+                    LiveEvent::Order { asset_no, order } => {
+                        let asset_no = *asset_no;
                         debug!(%asset_no, ?order, "Event::Order");
                         let received_order_resp = match wait_order_response {
                             WaitOrderResponse::Any => true,
@@ -442,23 +439,20 @@ where
                                     "Bot received an unmanaged order. \
                                     This should be handled by a Connector."
                                 );
-                                entry.insert(order);
+                                entry.insert(order.clone());
                             }
                         }
                         if received_order_resp {
                             return Ok(true);
                         }
                     }
-                    Some(LiveEvent::Position { asset_no, qty }) => {
-                        unsafe { self.state.get_unchecked_mut(asset_no) }.position = qty;
+                    LiveEvent::Position { asset_no, qty } => {
+                        unsafe { self.state.get_unchecked_mut(*asset_no) }.position = *qty;
                     }
-                    Some(LiveEvent::Error(error)) => {
+                    LiveEvent::Error(error) => {
                         if let Some(handler) = self.error_handler.as_mut() {
-                            handler(error)?;
+                            handler(error.clone())?;
                         }
-                    }
-                    None => {
-                        no_data += 1;
                     }
                 }
             }
